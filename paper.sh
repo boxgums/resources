@@ -15,6 +15,7 @@ readonly API="https://fill.papermc.io/v3/projects/paper"
 readonly MOJANG_MANIFEST="https://launchermeta.mojang.com/mc/game/version_manifest_v2.json"
 readonly UA="boxgums-paper-installer/2.0 (https://github.com/boxgums/resources)"
 readonly EULA_URL="https://aka.ms/MinecraftEULA"
+readonly CMD_VERSION=1   # bump when mcstart / mcwhitelist change, so installs update them once
 
 PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 ROOT="${PAPER_HOME:-$HOME/minecraft}"   # PAPER_HOME / PAPER_INPUT exist mainly for testing
@@ -23,6 +24,7 @@ INPUT="${PAPER_INPUT:-/dev/tty}"
 API_BODY="" API_ERR="" REPLY="" MENU_IDX=0 PART_FILE=""
 VERSION="" CHANNEL="" BUILD_ID="" BUILD_URL="" BUILD_SHA="" BUILD_SIZE=""
 JAVA_REQ="" JAVA_BIN="" JAVA_MAJOR="" RAM_MB="" DIR="" KEPT_JAR=0
+WHITELIST=0 MCSTART_OK=0
 
 # ───────────────────────────── interface ─────────────────────────────
 
@@ -505,6 +507,704 @@ save_settings() {
     write_start_script "$DIR"
 }
 
+# ───────────────────────────── global commands (mcstart, mcwhitelist) ─────────────────────────────
+# Both are small stand-alone scripts kept inside this installer. They are written to
+# $PREFIX/bin, which Termux always has on PATH, so nobody has to edit .bashrc.
+
+emit_mcstart() {
+    printf '#!/data/data/com.termux/files/usr/bin/bash\n# paper.sh-managed: mcstart v%s\n' "$CMD_VERSION"
+    cat <<'MCCMD_EOF'
+# mcstart: start any Minecraft server installed by paper.sh. Type: mcstart
+# This file is managed by paper.sh and may be replaced when the installer updates.
+# Your servers, worlds and settings are never touched by that.
+set -u
+
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+ROOT="${PAPER_HOME:-$HOME/minecraft}"
+INSTALL_CMD="curl -fsSL https://raw.githubusercontent.com/boxgums/resources/main/paper.sh | bash"
+
+# ── look and feel ──
+RST="" BOLD="" DIM="" ACC="" GRN="" YEL="" RED=""
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then
+    RST=$'\e[0m' BOLD=$'\e[1m' DIM=$'\e[2m' ACC=$'\e[36m' GRN=$'\e[32m' YEL=$'\e[33m' RED=$'\e[31m'
+fi
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+    *[Uu][Tt][Ff]-8* | *[Uu][Tt][Ff]8*)
+        C_TL="╭" C_TR="╮" C_BL="╰" C_BR="╯" C_H="─" C_V="│" C_LT="├" C_RT="┤" ;;
+    *)
+        C_TL="+" C_TR="+" C_BL="+" C_BR="+" C_H="-" C_V="|" C_LT="+" C_RT="+" ;;
+esac
+
+err()  { printf '\n  %sProblem:%s %s\n' "$RED$BOLD" "$RST" "$1" >&2; shift; local l; for l in "$@"; do printf '  %s\n' "$l" >&2; done; printf '\n' >&2; }
+note() { printf '  %s\n' "$*"; }
+
+conf_get() { # conf_get FILE KEY
+    local k v
+    [ -f "$1" ] || return 0
+    while IFS='=' read -r k v || [ -n "$k" ]; do
+        if [ "$k" = "$2" ]; then printf '%s' "$v"; return 0; fi
+    done <"$1"
+    return 0
+}
+
+conf_set() { # conf_set FILE KEY VALUE
+    { grep -v "^$2=" "$1" 2>/dev/null || true; printf '%s=%s\n' "$2" "$3"; } >"$1.tmp" &&
+        mv -f "$1.tmp" "$1"
+}
+
+meminfo_mb() {
+    local k v _
+    while read -r k v _; do
+        if [ "$k" = "$1:" ]; then printf '%s' "$((v / 1024))"; return 0; fi
+    done </proc/meminfo 2>/dev/null
+    printf '0'
+}
+
+# ── finding servers ──
+SERVERS=()
+find_servers() {
+    local f
+    SERVERS=()
+    shopt -s nullglob
+    for f in "$ROOT"/*/server.conf; do SERVERS+=("$(dirname "$f")"); done
+    shopt -u nullglob
+    if [ "${#SERVERS[@]}" -gt 1 ]; then
+        mapfile -t SERVERS < <(printf '%s\n' "${SERVERS[@]}" | sort -Vr)
+    fi
+}
+
+server_version() {
+    local v
+    v=$(conf_get "$1/server.conf" MC_VERSION)
+    printf '%s' "${v:-$(basename "$1")}"
+}
+
+no_servers_message() {
+    err "No Minecraft servers are installed yet." \
+        "Install one with this command, then type mcstart again:" \
+        "" "    $INSTALL_CMD"
+}
+
+# ── Java ──
+find_java() { # find_java MAJOR
+    local d
+    for d in "$PREFIX/lib/jvm/java-$1-openjdk" "$PREFIX/lib/jvm/openjdk-$1"; do
+        if [ -x "$d/bin/java" ]; then printf '%s' "$d/bin/java"; return 0; fi
+    done
+    return 1
+}
+
+java_major() { # java_major PATH
+    local out
+    out=$("$1" -version 2>&1 </dev/null) || return 1
+    [[ $out =~ version\ \"([0-9]+) ]] || return 1
+    printf '%s' "${BASH_REMATCH[1]}"
+}
+
+# resolve_java DIR → sets JAVA_BIN to the Java this server needs. Returns 1 with an explanation if impossible.
+JAVA_BIN=""
+resolve_java() {
+    local conf="$1/server.conf" need saved
+    need=$(conf_get "$conf" JAVA_MAJOR)
+    saved=$(conf_get "$conf" JAVA_BIN)
+    if [[ ! $need =~ ^[0-9]+$ ]] && [ -n "$saved" ] && [ -x "$saved" ]; then
+        need=$(java_major "$saved" || true)
+    fi
+    if [[ ! $need =~ ^[0-9]+$ ]]; then
+        err "I don't know which Java this server needs." \
+            "Run the installer again for this Minecraft version. Your world will be kept:" \
+            "" "    $INSTALL_CMD"
+        return 1
+    fi
+
+    JAVA_BIN=""
+    if [ -n "$saved" ] && [ -x "$saved" ] && [ "$(java_major "$saved" || true)" = "$need" ]; then
+        JAVA_BIN=$saved
+    else
+        JAVA_BIN=$(find_java "$need" || true)
+    fi
+
+    if [ -z "$JAVA_BIN" ]; then
+        printf '\n  %sJava %s is missing.%s\n' "$YEL$BOLD" "$need" "$RST"
+        note "Java is the program that runs Minecraft. This server needs Java $need,"
+        note "and it is not installed (or was removed)."
+        if ! command -v pkg >/dev/null 2>&1; then
+            err "I can't install it automatically here." "Install the package openjdk-$need with your package manager."
+            return 1
+        fi
+        local ans
+        printf '\n  Install Java %s now? (Y/n): ' "$need"
+        read -r ans || { printf '\n'; return 1; }
+        case "${ans:-y}" in
+            [Yy] | [Yy][Ee][Ss]) ;;
+            *) note "Okay, not installing. The server was not started."; return 1 ;;
+        esac
+        if ! pkg install -y "openjdk-$need" </dev/null; then
+            err "Termux could not install openjdk-$need." \
+                "Check your internet connection and try again. If the message above mentions a" \
+                "conflict with another openjdk package, remove that one first (pkg uninstall openjdk-XX)." \
+                "Nothing was removed for you."
+            return 1
+        fi
+        JAVA_BIN=$(find_java "$need" || true)
+        if [ -z "$JAVA_BIN" ]; then
+            err "openjdk-$need was installed but I could not find its java program."
+            return 1
+        fi
+    fi
+
+    if [ "$(java_major "$JAVA_BIN" || true)" != "$need" ]; then
+        err "Expected Java $need but $JAVA_BIN reports a different version." \
+            "Run the installer again to repair it: $INSTALL_CMD"
+        return 1
+    fi
+    [ "$saved" = "$JAVA_BIN" ] || conf_set "$conf" JAVA_BIN "$JAVA_BIN" 2>/dev/null || true
+    return 0
+}
+
+# ── RAM ──
+RAM_MB=""
+resolve_ram() { # resolve_ram DIR
+    local conf="$1/server.conf" total d
+    RAM_MB=$(conf_get "$conf" RAM_MB)
+    total=$(meminfo_mb MemTotal)
+    if [[ ! $RAM_MB =~ ^[0-9]+$ ]] || [ "$RAM_MB" -lt 512 ]; then
+        d=$((total / 2))
+        if [ "$d" -gt 4096 ]; then d=4096; fi
+        d=$((d / 256 * 256))
+        if [ "$d" -lt 1024 ]; then d=1024; fi
+        RAM_MB=$d
+        conf_set "$conf" RAM_MB "$RAM_MB" 2>/dev/null || true
+        note "${DIM}No RAM setting was saved, so I chose a safe $RAM_MB MB (about half your phone's memory, max 4 GB).${RST}"
+    fi
+    if [ "$total" -gt 0 ] && [ "$RAM_MB" -gt $((total * 3 / 4)) ]; then
+        printf '  %sWarning:%s %s MB is a lot for this phone. Android may close Termux.\n' "$YEL" "$RST" "$RAM_MB"
+    fi
+}
+
+# ── EULA ──
+resolve_eula() { # resolve_eula DIR
+    grep -qx 'eula=true' "$1/eula.txt" 2>/dev/null && return 0
+    note "Running a Minecraft server requires accepting the Minecraft EULA:"
+    note "${BOLD}https://aka.ms/MinecraftEULA${RST}"
+    local ans
+    printf '\n  Do you accept the Minecraft EULA? (y/N): '
+    read -r ans || { printf '\n'; return 1; }
+    case "$ans" in
+        [Yy] | [Yy][Ee][Ss])
+            { grep -v '^eula=' "$1/eula.txt" 2>/dev/null || true; echo "eula=true"; } >"$1/eula.txt.tmp" &&
+                mv -f "$1/eula.txt.tmp" "$1/eula.txt" && return 0
+            err "Could not write eula.txt in $1"; return 1 ;;
+        *) note "EULA not accepted, so the server will not start."; return 1 ;;
+    esac
+}
+
+# ── starting ──
+start_server() { # start_server DIR → returns 1 if it could not start (caller shows the menu again)
+    local dir=$1 ver
+    ver=$(server_version "$dir")
+    if [ ! -d "$dir" ]; then err "The folder for Minecraft $ver is gone ($dir)."; return 1; fi
+    if [ ! -f "$dir/server.jar" ]; then
+        err "The server file (server.jar) for Minecraft $ver is missing." \
+            "Your worlds are safe. Reinstall that version with the installer to get it back:" \
+            "" "    $INSTALL_CMD"
+        return 1
+    fi
+    resolve_java "$dir" || return 1
+    resolve_ram "$dir"
+    resolve_eula "$dir" || return 1
+    cd "$dir" || { err "Could not open $dir"; return 1; }
+
+    printf '\n  %s▶ Starting Minecraft %s%s  %s(Java %s, %s MB RAM)%s\n' \
+        "$GRN$BOLD" "$ver" "$RST" "$DIM" "$(java_major "$JAVA_BIN" || echo '?')" "$RAM_MB" "$RST"
+    note "${DIM}Type \"stop\" to shut the server down safely.${RST}"
+    printf '\n'
+    command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock 2>/dev/null
+    local xms=$((RAM_MB < 512 ? RAM_MB : 512)) rc=0
+    "$JAVA_BIN" -Xms"${xms}M" -Xmx"${RAM_MB}M" -jar server.jar --nogui || rc=$?
+    printf '\n  Server stopped.'
+    [ "$rc" -eq 0 ] || printf ' %s(exit code %s)%s' "$YEL" "$rc" "$RST"
+    printf '\n'
+    exit "$rc"
+}
+
+# ── menu ──
+draw_menu() {
+    local -a rows=("$@")
+    local w=36 r i line
+    for r in "${rows[@]}"; do [ "${#r}" -gt $((w - 4)) ] && w=$((${#r} + 4)); done
+    local bar=""
+    for ((i = 0; i < w; i++)); do bar+="$C_H"; done
+    center() {
+        local t=$1 l=$(((w - ${#1}) / 2))
+        printf '%s%*s%s%*s%s\n' "$C_V" "$l" "" "$t" "$((w - l - ${#t}))" "" "$C_V"
+    }
+    row() { printf '%s  %-*s%s\n' "$C_V" "$((w - 2))" "$1" "$C_V"; }
+    blank() { printf '%s%*s%s\n' "$C_V" "$w" "" "$C_V"; }
+    printf '\n%s%s%s%s\n' "$C_TL" "$bar" "$C_TR" ""
+    center "PaperMC Server"
+    blank
+    center "Select a server"
+    printf '%s%s%s\n' "$C_LT" "$bar" "$C_RT"
+    blank
+    for line in "${rows[@]}"; do row "$line"; done
+    blank
+    row "0. Exit"
+    blank
+    printf '%s%s%s\n\n' "$C_BL" "$bar" "$C_BR"
+}
+
+choose_and_start() {
+    local -a rows=()
+    local i n=${#SERVERS[@]} choice
+    for ((i = 0; i < n; i++)); do rows+=("$((i + 1)). Minecraft $(server_version "${SERVERS[$i]}")"); done
+    while :; do
+        draw_menu "${rows[@]}"
+        while :; do
+            printf 'Choose a server: '
+            read -r choice || { printf '\n'; exit 0; }
+            choice=${choice#"${choice%%[![:space:]]*}"}
+            choice=${choice%"${choice##*[![:space:]]}"}
+            if [ "$choice" = 0 ]; then note "Goodbye!"; exit 0; fi
+            if [[ $choice =~ ^[0-9]+$ ]] && [ "$((10#$choice))" -ge 1 ] && [ "$((10#$choice))" -le "$n" ]; then
+                start_server "${SERVERS[$((10#$choice - 1))]}" || true
+                break   # could not start: show the menu again
+            fi
+            printf '  %sPlease type a number from 0 to %s.%s\n' "$YEL" "$n" "$RST"
+        done
+    done
+}
+
+list_servers() {
+    local d i=0 ver jmaj ram flag
+    for d in "${SERVERS[@]}"; do
+        i=$((i + 1))
+        ver=$(server_version "$d")
+        jmaj=$(conf_get "$d/server.conf" JAVA_MAJOR)
+        ram=$(conf_get "$d/server.conf" RAM_MB)
+        flag=""
+        [ -f "$d/server.jar" ] || flag="  ${YEL}(server.jar missing)${RST}"
+        printf '  %s. Minecraft %s  %sJava %s, %s MB%s%s\n' "$i" "$ver" "$DIM" "${jmaj:-?}" "${ram:-?}" "$RST" "$flag"
+        printf '     %s%s%s\n' "$DIM" "$d" "$RST"
+    done
+}
+
+usage() {
+    cat <<EOF
+
+  mcstart - start a Minecraft server with one command
+
+    mcstart          pick a server from a menu and start it
+    mcstart --list   show installed servers without starting one
+    mcstart --help   show this help
+
+  Install more servers, or change a server's RAM, by running the installer:
+    $INSTALL_CMD
+
+  Servers live in: $ROOT
+
+EOF
+}
+
+case "${1:-}" in
+    -h | --help) usage; exit 0 ;;
+    -l | --list)
+        find_servers
+        if [ "${#SERVERS[@]}" -eq 0 ]; then no_servers_message; exit 1; fi
+        printf '\n  %sInstalled servers%s\n\n' "$BOLD" "$RST"
+        list_servers
+        printf '\n'
+        exit 0 ;;
+    "") ;;
+    *) err "I don't understand \"$1\"." "Try: mcstart --help"; exit 2 ;;
+esac
+
+find_servers
+if [ "${#SERVERS[@]}" -eq 0 ]; then no_servers_message; exit 1; fi
+choose_and_start
+MCCMD_EOF
+}
+
+emit_mcwhitelist() {
+    printf '#!/data/data/com.termux/files/usr/bin/bash\n# paper.sh-managed: mcwhitelist v%s\n' "$CMD_VERSION"
+    cat <<'MCCMD_EOF'
+# mcwhitelist: choose which players may join your Minecraft server. Type: mcwhitelist
+# This file is managed by paper.sh and may be replaced when the installer updates.
+# Your servers, worlds and settings are never touched by that.
+set -u
+
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+ROOT="${PAPER_HOME:-$HOME/minecraft}"
+UA="boxgums-paper-installer/2.0 (https://github.com/boxgums/resources)"
+INSTALL_CMD="curl -fsSL https://raw.githubusercontent.com/boxgums/resources/main/paper.sh | bash"
+
+RST="" BOLD="" DIM="" ACC="" GRN="" YEL="" RED=""
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then
+    RST=$'\e[0m' BOLD=$'\e[1m' DIM=$'\e[2m' ACC=$'\e[36m' GRN=$'\e[32m' YEL=$'\e[33m' RED=$'\e[31m'
+fi
+
+say()  { printf '  %s\n' "$*"; }
+good() { printf '  %s+%s %s\n' "$GRN" "$RST" "$*"; }
+warn() { printf '  %s!%s %s\n' "$YEL" "$RST" "$*"; }
+err()  { printf '\n  %sProblem:%s %s\n' "$RED$BOLD" "$RST" "$1" >&2; shift; local l; for l in "$@"; do printf '  %s\n' "$l" >&2; done; printf '\n' >&2; }
+
+conf_get() { # conf_get FILE KEY
+    local k v
+    [ -f "$1" ] || return 0
+    while IFS='=' read -r k v || [ -n "$k" ]; do
+        if [ "$k" = "$2" ]; then printf '%s' "$v"; return 0; fi
+    done <"$1"
+    return 0
+}
+
+conf_set() {
+    { grep -v "^$2=" "$1" 2>/dev/null || true; printf '%s=%s\n' "$2" "$3"; } >"$1.tmp" &&
+        mv -f "$1.tmp" "$1"
+}
+
+# prop_get FILE KEY DEFAULT / prop_set FILE KEY VALUE  (server.properties, other lines are kept as they are)
+prop_get() {
+    local k v
+    if [ -f "$1" ]; then
+        while IFS='=' read -r k v || [ -n "$k" ]; do
+            if [ "$k" = "$2" ]; then printf '%s' "${v%$'\r'}"; return 0; fi
+        done <"$1"
+    fi
+    printf '%s' "$3"
+}
+
+prop_set() {
+    if [ -f "$1" ] && grep -q "^$2=" "$1"; then
+        sed -i "s/^$2=.*/$2=$3/" "$1"
+    else
+        printf '%s=%s\n' "$2" "$3" >>"$1"
+    fi
+}
+
+command -v jq >/dev/null 2>&1 || {
+    err "The helper tool \"jq\" is missing." "Install it with:  pkg install jq"
+    exit 1
+}
+
+# ── choosing a server ──
+SERVERS=()
+find_servers() {
+    local f
+    SERVERS=()
+    shopt -s nullglob
+    for f in "$ROOT"/*/server.conf; do SERVERS+=("$(dirname "$f")"); done
+    shopt -u nullglob
+    if [ "${#SERVERS[@]}" -gt 1 ]; then
+        mapfile -t SERVERS < <(printf '%s\n' "${SERVERS[@]}" | sort -Vr)
+    fi
+}
+
+sver() { local v; v=$(conf_get "$1/server.conf" MC_VERSION); printf '%s' "${v:-$(basename "$1")}"; }
+
+DIR=""
+pick_server() {
+    local i n choice
+    find_servers
+    n=${#SERVERS[@]}
+    if [ "$n" -eq 0 ]; then
+        err "No Minecraft servers are installed yet." "Install one first:" "" "    $INSTALL_CMD"
+        return 1
+    fi
+    if [ "$n" -eq 1 ]; then DIR=${SERVERS[0]}; return 0; fi
+    printf '\n  %sWhich server is the whitelist for?%s\n\n' "$BOLD" "$RST"
+    for ((i = 0; i < n; i++)); do printf '   %s%d.%s Minecraft %s\n' "$ACC" "$((i + 1))" "$RST" "$(sver "${SERVERS[$i]}")"; done
+    printf '   %s0.%s Exit\n' "$ACC" "$RST"
+    while :; do
+        printf '\n  Choose a server: '
+        read -r choice || { printf '\n'; return 1; }
+        [ "$choice" = 0 ] && return 1
+        if [[ $choice =~ ^[0-9]+$ ]] && [ "$((10#$choice))" -ge 1 ] && [ "$((10#$choice))" -le "$n" ]; then
+            DIR=${SERVERS[$((10#$choice - 1))]}
+            return 0
+        fi
+        warn "Please type a number from 0 to $n."
+    done
+}
+
+# ── players ──
+valid_name() { [[ $1 =~ ^[A-Za-z0-9_]{3,16}$ ]]; }
+
+dash_uuid() { # 32 hex → 8-4-4-4-12
+    local h=${1,,}
+    printf '%s-%s-%s-%s-%s' "${h:0:8}" "${h:8:4}" "${h:12:4}" "${h:16:4}" "${h:20:12}"
+}
+
+offline_uuid() { # servers with online-mode=false use this name-based id
+    local h b6 b8
+    h=$(printf 'OfflinePlayer:%s' "$1" | md5sum | cut -c1-32)
+    b6=$(printf '%02x' $(((0x${h:12:2} & 0x0f) | 0x30)))
+    b8=$(printf '%02x' $(((0x${h:16:2} & 0x3f) | 0x80)))
+    dash_uuid "${h:0:12}${b6}${h:14:2}${b8}${h:18}"
+}
+
+# lookup_player NAME → sets P_NAME and P_UUID, or returns 1 after explaining
+P_NAME="" P_UUID=""
+lookup_player() {
+    local name=$1 online raw code body id
+    online=$(prop_get "$DIR/server.properties" online-mode true)
+    if [ "$online" = false ]; then
+        P_NAME=$name P_UUID=$(offline_uuid "$name")
+        return 0
+    fi
+    raw=$(curl -sS --max-time 15 --connect-timeout 10 -H "User-Agent: $UA" \
+        -w $'\n%{http_code}' "https://api.mojang.com/users/profiles/minecraft/$name" 2>&1 </dev/null) || {
+        warn "Could not reach Mojang to look up \"$name\". Check your internet connection."
+        return 1
+    }
+    code=${raw##*$'\n'}
+    body=${raw%$'\n'*}
+    case $code in
+        200) ;;
+        204 | 404) warn "There is no Minecraft Java player called \"$name\". Check the spelling."; return 1 ;;
+        *) warn "Mojang answered with an error ($code). Try again in a minute."; return 1 ;;
+    esac
+    id=$(jq -r '.id // empty' <<<"$body" 2>/dev/null || true)
+    P_NAME=$(jq -r '.name // empty' <<<"$body" 2>/dev/null || true)
+    if [[ ! $id =~ ^[0-9a-fA-F]{32}$ ]] || [ -z "$P_NAME" ]; then
+        warn "Mojang's answer for \"$name\" looked wrong. Try again later."
+        return 1
+    fi
+    P_UUID=$(dash_uuid "$id")
+}
+
+# ── the whitelist file ──
+WL=""
+prepare_file() {
+    WL="$DIR/whitelist.json"
+    if [ ! -f "$WL" ]; then printf '[]\n' >"$WL" || { err "Could not create $WL"; return 1; }; fi
+    if ! jq -e 'type == "array"' "$WL" >/dev/null 2>&1; then
+        err "whitelist.json in $DIR is damaged, so I left it alone." \
+            "Fix or rename that file, then run mcwhitelist again."
+        return 1
+    fi
+}
+
+wl_write() { # wl_write JQ_ARGS... (filter is last arg)
+    jq "$@" "$WL" >"$WL.tmp" && mv -f "$WL.tmp" "$WL"
+}
+
+server_running() {
+    local p
+    for p in /proc/[0-9]*; do
+        [ "$(readlink "$p/cwd" 2>/dev/null)" = "$DIR" ] || continue
+        tr '\0' ' ' <"$p/cmdline" 2>/dev/null | grep -q 'server.jar' && return 0
+    done
+    return 1
+}
+
+running_note() {
+    if server_running; then
+        warn "This server is running right now. Type  whitelist reload  in its console"
+        say "  so it notices the change (or ask the player to rejoin later)."
+    fi
+}
+
+whitelist_on() { [ "$(prop_get "$DIR/server.properties" white-list false)" = true ]; }
+
+show_list() {
+    local n
+    n=$(jq 'length' "$WL")
+    printf '\n  %sPlayers allowed on Minecraft %s%s\n\n' "$BOLD" "$(sver "$DIR")" "$RST"
+    if [ "$n" -eq 0 ]; then say "(nobody yet)"; else jq -r '.[].name' "$WL" | sort -f | sed 's/^/   • /'; fi
+}
+
+add_players() {
+    local name changed=0
+    printf '\n'
+    say "Type a player's exact Minecraft name and press Enter."
+    say "Add as many as you like, one at a time. Press Enter on an empty line when done."
+    while :; do
+        printf '\n  Player name: '
+        read -r name || { printf '\n'; break; }
+        name=${name#"${name%%[![:space:]]*}"}
+        name=${name%"${name##*[![:space:]]}"}
+        [ -z "$name" ] && break
+        if ! valid_name "$name"; then
+            warn "Names use 3-16 letters, numbers or underscores (no spaces)."
+            continue
+        fi
+        lookup_player "$name" || continue
+        if wl_write --arg u "$P_UUID" --arg n "$P_NAME" \
+            'map(select((.name | ascii_downcase) != ($n | ascii_downcase))) + [{uuid: $u, name: $n}]'; then
+            good "Added $P_NAME"
+            changed=1
+        else
+            err "Could not save whitelist.json."
+        fi
+    done
+    [ "$changed" = 1 ] && running_note
+    return 0
+}
+
+remove_player() {
+    local -a names=()
+    local i choice
+    mapfile -t names < <(jq -r '.[].name' "$WL" | sort -f)
+    if [ "${#names[@]}" -eq 0 ]; then warn "The whitelist is empty."; return 0; fi
+    printf '\n'
+    for ((i = 0; i < ${#names[@]}; i++)); do printf '   %s%d.%s %s\n' "$ACC" "$((i + 1))" "$RST" "${names[$i]}"; done
+    printf '   %s0.%s Cancel\n' "$ACC" "$RST"
+    while :; do
+        printf '\n  Remove which player (number): '
+        read -r choice || { printf '\n'; return 0; }
+        [ "$choice" = 0 ] && return 0
+        if [[ $choice =~ ^[0-9]+$ ]] && [ "$((10#$choice))" -ge 1 ] && [ "$((10#$choice))" -le "${#names[@]}" ]; then
+            local who=${names[$((10#$choice - 1))]}
+            if wl_write --arg n "$who" 'map(select((.name | ascii_downcase) != ($n | ascii_downcase)))'; then
+                good "Removed $who"
+                running_note
+            else
+                err "Could not save whitelist.json."
+            fi
+            return 0
+        fi
+        warn "Please type a number from 0 to ${#names[@]}."
+    done
+}
+
+toggle_whitelist() {
+    local props="$DIR/server.properties"
+    if whitelist_on; then
+        prop_set "$props" white-list false
+        prop_set "$props" enforce-whitelist false
+        conf_set "$DIR/server.conf" WHITELIST 0
+        good "Whitelist turned OFF. Anyone can join (after the server restarts)."
+    else
+        prop_set "$props" white-list true
+        prop_set "$props" enforce-whitelist true
+        conf_set "$DIR/server.conf" WHITELIST 1
+        good "Whitelist turned ON. Only listed players can join (after the server restarts)."
+    fi
+    if server_running; then warn "The server is running: restart it for this switch to apply."; fi
+}
+
+main_menu() {
+    local state choice
+    while :; do
+        if whitelist_on; then state="${GRN}ON${RST}"; else state="${YEL}OFF${RST}"; fi
+        printf '\n  %sWhitelist for Minecraft %s%s  (currently %s)\n' "$BOLD" "$(sver "$DIR")" "$RST" "$state"
+        say "${DIM}A whitelist lets only the players you list join your server.${RST}"
+        printf '\n   %s1.%s Add players\n   %s2.%s Remove a player\n   %s3.%s Show who is allowed\n   %s4.%s Turn whitelist on/off\n   %s0.%s Done\n' \
+            "$ACC" "$RST" "$ACC" "$RST" "$ACC" "$RST" "$ACC" "$RST" "$ACC" "$RST"
+        printf '\n  Your choice: '
+        read -r choice || { printf '\n'; return 0; }
+        case $choice in
+            1) add_players ;;
+            2) remove_player ;;
+            3) show_list ;;
+            4) toggle_whitelist ;;
+            0) say "Done. Start your server with:  mcstart"; return 0 ;;
+            *) warn "Please type a number from 0 to 4." ;;
+        esac
+    done
+}
+
+usage() {
+    cat <<EOF
+
+  mcwhitelist - choose who may join your Minecraft server
+
+    mcwhitelist          open the whitelist menu
+    mcwhitelist --help   show this help
+
+  You need each player's exact Minecraft (Java Edition) name.
+  Servers are in: $ROOT
+
+EOF
+}
+
+TARGET=""
+case "${1:-}" in
+    -h | --help) usage; exit 0 ;;
+    --dir) TARGET=${2:-}; [ -d "$TARGET" ] || { err "Folder not found: $TARGET"; exit 2; } ;;
+    "") ;;
+    *) err "I don't understand \"$1\"." "Try: mcwhitelist --help"; exit 2 ;;
+esac
+
+if [ -n "$TARGET" ]; then DIR=$TARGET; else pick_server || exit 0; fi
+prepare_file || exit 1
+main_menu
+MCCMD_EOF
+}
+
+# install_command NAME → installs or updates $PREFIX/bin/NAME. Never touches a file that
+# paper.sh did not create, and does not rewrite one that is already up to date.
+install_command() {
+    local name=$1 dest="$PREFIX/bin/$1" tmp
+    mkdir -p "$PREFIX/bin" 2>/dev/null || { warn "Could not create $PREFIX/bin"; return 1; }
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+        if ! grep -qx "# paper.sh-managed: $name v[0-9]*" "$dest" 2>/dev/null; then
+            warn "A different \"$name\" command already exists ($dest). I left it alone."
+            return 1
+        fi
+        if grep -qx "# paper.sh-managed: $name v$CMD_VERSION" "$dest"; then
+            ok "Command \"$name\" is already installed"
+            return 0
+        fi
+    fi
+    tmp=$(mktemp "$dest.XXXXXX") || { warn "Could not write to $PREFIX/bin"; return 1; }
+    if "emit_$name" >"$tmp" && bash -n "$tmp" && chmod 755 "$tmp" && mv -f "$tmp" "$dest"; then
+        ok "Command \"$name\" installed. Type: $name"
+        return 0
+    fi
+    rm -f "$tmp"
+    warn "Could not install the \"$name\" command."
+    return 1
+}
+
+install_commands() {
+    if install_command mcstart; then MCSTART_OK=1; fi
+    # Keep mcwhitelist current if it was installed before (it is created when a whitelist is chosen).
+    if [ -e "$PREFIX/bin/mcwhitelist" ]; then install_command mcwhitelist || true; fi
+    case ":$PATH:" in
+        *":$PREFIX/bin:"*) ;;
+        *) warn "$PREFIX/bin is not on your PATH. Close and reopen Termux; if it still fails, mcstart cannot be found by name." ;;
+    esac
+}
+
+prop_set() { # prop_set FILE KEY VALUE → changes one line of server.properties, keeps the rest
+    if [ -f "$1" ] && grep -q "^$2=" "$1"; then
+        sed -i "s/^$2=.*/$2=$3/" "$1"
+    else
+        printf '%s=%s\n' "$2" "$3" >>"$1"
+    fi
+}
+
+setup_whitelist() {
+    local props="$DIR/server.properties"
+    WHITELIST=0
+    printf '\n'
+    say "A ${BOLD}whitelist${RST} is a list of players who are allowed to join."
+    say "Everyone else is kept out, even if they find your server address."
+    say "${DIM}Recommended if you only want to play with friends.${RST}"
+    if confirm "Do you want a whitelist?" y; then
+        WHITELIST=1
+        prop_set "$props" white-list true
+        prop_set "$props" enforce-whitelist true
+        conf_set "$DIR/server.conf" WHITELIST 1
+        ok "Whitelist turned on for Minecraft $VERSION"
+        if install_command mcwhitelist; then
+            say "${DIM}Use the command ${RST}${BOLD}mcwhitelist${RST}${DIM} any time to add or remove players.${RST}"
+            if confirm "Add players to the whitelist now?" y; then
+                bash "$PREFIX/bin/mcwhitelist" --dir "$DIR" <&3 || warn "mcwhitelist stopped early. Run mcwhitelist later to finish."
+            fi
+        else
+            warn "Whitelist is on, but the mcwhitelist command could not be installed."
+        fi
+    else
+        conf_set "$DIR/server.conf" WHITELIST 0
+        info "No whitelist. Anyone who knows your server address can join."
+        if [ "$(grep -s '^white-list=' "$props" | tail -n1)" = "white-list=true" ]; then
+            warn "This server already had a whitelist on. I left that setting as it was."
+        fi
+    fi
+}
+
 # ───────────────────────────── flows ─────────────────────────────
 
 run_server() { # run_server DIR  (stdin must be the terminal so the console works)
@@ -523,11 +1223,12 @@ install_server() {
     ensure_java
     download_jar
 
-    step 5 6 "Memory and EULA"
+    step 5 6 "Memory, whitelist and EULA"
     local current
     current=$(conf_get "$DIR/server.conf" RAM_MB)
     ask_ram "$current"
     save_settings
+    setup_whitelist
     local accepted=0
     ensure_eula "$DIR" && accepted=1
 
@@ -546,10 +1247,19 @@ summary() {
     printf '   %-11s %s\n' "Build" "#$(conf_get "$DIR/server.conf" BUILD) ($(conf_get "$DIR/server.conf" CHANNEL))"
     printf '   %-11s %s\n' "Java" "$JAVA_MAJOR"
     printf '   %-11s %s MB\n' "RAM" "$RAM_MB"
+    printf '   %-11s %s\n' "Whitelist" "$([ "$WHITELIST" = 1 ] && echo on || echo off)"
     printf '   %-11s %s\n' "Folder" "$DIR"
-    printf '\n  %sStart it again later:%s\n' "$BOLD" "$RST"
-    printf '    bash %q\n' "$DIR/start.sh"
-    printf '  %sor run the installer again and pick "Start a server".%s\n' "$DIM" "$RST"
+    if [ "$MCSTART_OK" = 1 ]; then
+        printf '\n  %sStart your server any time, from any folder, by typing:%s\n' "$BOLD" "$RST"
+        printf '    %smcstart%s\n' "$ACC$BOLD" "$RST"
+    else
+        printf '\n  %sStart it again later:%s\n' "$BOLD" "$RST"
+        printf '    bash %q\n' "$DIR/start.sh"
+        printf '  %sor run the installer again and pick "Start a server".%s\n' "$DIM" "$RST"
+    fi
+    if [ "$WHITELIST" = 1 ]; then
+        printf '  %sChange who can join by typing:%s %smcwhitelist%s\n' "$DIM" "$RST" "$ACC$BOLD" "$RST"
+    fi
     [ "$1" = 1 ] || warn "You have not accepted the EULA yet. The server will not start until you do."
 }
 
@@ -626,6 +1336,7 @@ main() {
     check_termux
     info "Checking tools..."
     ensure_tools
+    install_commands
     list_servers
     if [ "${#SERVERS[@]}" -eq 0 ]; then
         say "No servers installed yet. Let's set one up."
