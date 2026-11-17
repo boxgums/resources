@@ -1461,12 +1461,23 @@ install_command() {
 }
 
 install_commands() {
-    if install_command mcstart; then MCSTART_OK=1; fi
-    # Keep mcwhitelist current if it was installed before (it is created when a whitelist is chosen).
-    if [ -e "$PREFIX/bin/mcwhitelist" ]; then install_command mcwhitelist || true; fi
+    if install_command mcstart; then
+        MCSTART_OK=1
+    fi
+
+    # Install mcwhitelist for everyone, even if they choose
+    # not to enable the whitelist during server setup.
+    if install_command mcwhitelist; then
+        ok "mcwhitelist is ready. Type mcwhitelist to use it."
+    else
+        warn "Could not install mcwhitelist."
+    fi
+
     case ":$PATH:" in
         *":$PREFIX/bin:"*) ;;
-        *) warn "$PREFIX/bin is not on your PATH. Close and reopen Termux; if it still fails, mcstart cannot be found by name." ;;
+        *)
+            warn "$PREFIX/bin is not on your PATH. Close and reopen Termux."
+            ;;
     esac
 }
 
