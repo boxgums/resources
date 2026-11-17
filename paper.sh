@@ -105,7 +105,7 @@ VERSION_JSON=$(curl -fsSL \
     error "Could not fetch version information."
 
 JAVA_VERSION=$(printf '%s' "$VERSION_JSON" |
-    jq -r '.java.version.minimum // empty')
+    jq -r '.version.java.version.minimum // empty')
 
 [[ "$JAVA_VERSION" =~ ^[0-9]+$ ]] ||
     error "Could not determine required Java version."
