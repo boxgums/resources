@@ -3,6 +3,7 @@
 # Copyright (C) boxgums. Licensed under GPL-3.0-or-later.
 #
 # Usage:  curl -fsSL https://raw.githubusercontent.com/boxgums/resources/main/paper.sh | bash
+#         (add  -s -- --install  to go straight to installing a server, or  -s -- --update  to only refresh mcstart)
 #
 # Everything runs inside main(), so bash has parsed the whole script before
 # anything executes. That stops programs like `pkg` from swallowing the rest of
@@ -15,7 +16,7 @@ readonly API="https://fill.papermc.io/v3/projects/paper"
 readonly MOJANG_MANIFEST="https://launchermeta.mojang.com/mc/game/version_manifest_v2.json"
 readonly UA="boxgums-paper-installer/2.0 (https://github.com/boxgums/resources)"
 readonly EULA_URL="https://aka.ms/MinecraftEULA"
-readonly CMD_VERSION=1   # bump when mcstart / mcwhitelist change, so installs update them once
+readonly CMD_VERSION=2   # shown in the managed-file marker; installs also compare file contents
 
 PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 ROOT="${PAPER_HOME:-$HOME/minecraft}"   # PAPER_HOME / PAPER_INPUT exist mainly for testing
@@ -521,7 +522,8 @@ set -u
 
 PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 ROOT="${PAPER_HOME:-$HOME/minecraft}"
-INSTALL_CMD="curl -fsSL https://raw.githubusercontent.com/boxgums/resources/main/paper.sh | bash"
+INSTALLER_URL="${PAPER_INSTALLER_URL:-https://raw.githubusercontent.com/boxgums/resources/main/paper.sh}"
+INSTALL_CMD="curl -fsSL $INSTALLER_URL | bash"
 
 # ── look and feel ──
 RST="" BOLD="" DIM="" ACC="" GRN="" YEL="" RED=""
@@ -581,7 +583,7 @@ server_version() {
 
 no_servers_message() {
     err "No Minecraft servers are installed yet." \
-        "Install one with this command, then type mcstart again:" \
+        "Type mcstart and press i to install one, or run:" \
         "" "    $INSTALL_CMD"
 }
 
@@ -729,10 +731,280 @@ start_server() { # start_server DIR → returns 1 if it could not start (caller 
 }
 
 # ── menu ──
+# ── small helpers for the management menus ──
+warn() { printf '  %s!%s %s\n' "$YEL" "$RST" "$*"; }
+good() { printf '  %s+%s %s\n' "$GRN" "$RST" "$*"; }
+
+trim() { local s=$1; s=${s#"${s%%[![:space:]]*}"}; s=${s%"${s##*[![:space:]]}"}; printf '%s' "$s"; }
+
+# yesno "Question" y|n → status 0 for yes. Closed input counts as "no" (the safe answer).
+yesno() {
+    local def=${2:-n} hint="y/N" a
+    [ "$def" = y ] && hint="Y/n"
+    while :; do
+        printf '\n  %s (%s): ' "$1" "$hint"
+        read -r a || { printf '\n'; return 1; }
+        case "$(trim "${a:-$def}")" in
+            [Yy] | [Yy][Ee][Ss]) return 0 ;;
+            [Nn] | [Nn][Oo]) return 1 ;;
+            *) warn "Please answer y or n." ;;
+        esac
+    done
+}
+
+# pick_from "Title" item... → sets PICK (1-based). Returns 1 on Back (0) or closed input.
+PICK=0
+pick_from() {
+    local title=$1 c i
+    shift
+    local -a items=("$@")
+    local n=${#items[@]}
+    printf '\n  %s%s%s\n\n' "$BOLD" "$title" "$RST"
+    for ((i = 0; i < n; i++)); do printf '   %d. %s\n' "$((i + 1))" "${items[$i]}"; done
+    printf '   0. Back\n'
+    while :; do
+        printf '\n  Choose: '
+        read -r c || { printf '\n'; return 1; }
+        c=$(trim "$c")
+        [ "$c" = 0 ] && return 1
+        if [[ $c =~ ^[0-9]+$ ]] && [ "$((10#$c))" -ge 1 ] && [ "$((10#$c))" -le "$n" ]; then
+            PICK=$((10#$c))
+            return 0
+        fi
+        warn "Please type a number from 0 to $n."
+    done
+}
+
+# True if a java process is running inside the server folder.
+server_running() {
+    local p
+    for p in /proc/[0-9]*; do
+        [ "$(readlink "$p/cwd" 2>/dev/null)" = "$1" ] || continue
+        tr '\0' ' ' <"$p/cmdline" 2>/dev/null | grep -q 'server.jar' && return 0
+    done
+    return 1
+}
+
+# ── installing / updating through the installer ──
+# run_installer [flags] → downloads the newest installer, checks it, and runs it.
+run_installer() {
+    local tmp rc=0
+    tmp=$(mktemp "${TMPDIR:-/tmp}/paper-installer.XXXXXX") || { err "Could not create a temporary file."; return 1; }
+    if [[ $INSTALLER_URL == /* ]]; then
+        cp -- "$INSTALLER_URL" "$tmp" 2>/dev/null || { rm -f "$tmp"; err "Could not read $INSTALLER_URL"; return 1; }
+    else
+        if ! command -v curl >/dev/null 2>&1; then
+            rm -f "$tmp"; err "The download tool \"curl\" is missing." "Install it with:  pkg install curl"; return 1
+        fi
+        if ! curl -fsSL --retry 2 --connect-timeout 15 --max-time 90 "$INSTALLER_URL" -o "$tmp" </dev/null; then
+            rm -f "$tmp"
+            err "Could not download the installer." "Check your internet connection and try again."
+            return 1
+        fi
+    fi
+    if ! [ -s "$tmp" ] || ! grep -q 'PaperMC installer' "$tmp" || ! bash -n "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        err "The downloaded installer looks wrong, so I did not run it." "Nothing was changed. Try again in a few minutes."
+        return 1
+    fi
+    bash "$tmp" "$@" || rc=$?
+    rm -f "$tmp"
+    return "$rc"
+}
+
+install_server_menu() {
+    printf '\n  %sInstall a new server%s\n' "$BOLD" "$RST"
+    note "${DIM}Starting the installer. Your existing servers are not touched.${RST}"
+    run_installer --install || warn "The installer stopped early. Nothing was removed."
+}
+
+update_mcstart() {
+    printf '\n  %sUpdating mcstart%s\n' "$BOLD" "$RST"
+    if run_installer --update; then
+        return 0
+    fi
+    warn "Could not update right now. The mcstart you have still works."
+    return 1
+}
+
+# ── removing a server ──
+remove_server() {
+    local dir ver real root size jmaj
+    find_servers
+    if [ "${#SERVERS[@]}" -eq 0 ]; then warn "There are no servers to remove."; return 0; fi
+    local -a labels=()
+    for dir in "${SERVERS[@]}"; do labels+=("Minecraft $(server_version "$dir")"); done
+    pick_from "Which server do you want to remove?" "${labels[@]}" || return 0
+    dir=${SERVERS[$((PICK - 1))]}
+    ver=$(server_version "$dir")
+
+    # Safety: only ever delete a real server folder directly inside the servers folder.
+    root=$(cd "$ROOT" 2>/dev/null && pwd -P) || { err "Could not open $ROOT"; return 1; }
+    real=$(cd "$dir" 2>/dev/null && pwd -P) || { err "Could not open $dir"; return 1; }
+    if [ -L "$dir" ] || [ "$(dirname "$real")" != "$root" ] || [ ! -f "$real/server.conf" ]; then
+        err "That folder does not look like one of my servers, so I will not delete it." "$dir"
+        return 1
+    fi
+    if server_running "$real"; then
+        err "Minecraft $ver is running right now." "Type \"stop\" in its console first, then try again."
+        return 1
+    fi
+
+    size=$(du -sh "$real" 2>/dev/null | cut -f1)
+    jmaj=$(conf_get "$real/server.conf" JAVA_MAJOR)
+    printf '\n  %sThis will permanently delete Minecraft %s%s%s\n' "$RED$BOLD" "$ver" "$RST" ""
+    note "Folder: $real  ${size:+($size)}"
+    note "That includes its ${BOLD}world${RST}, plugins and settings. It cannot be undone."
+    printf '\n  Type %s%s%s to confirm, or just press Enter to cancel: ' "$BOLD" "$ver" "$RST"
+    local ans
+    read -r ans || { printf '\n'; return 0; }
+    if [ "$(trim "$ans")" != "$ver" ]; then note "Cancelled. Nothing was deleted."; return 0; fi
+
+    if rm -rf -- "$real" && [ ! -e "$real" ]; then
+        good "Minecraft $ver was removed."
+    else
+        err "Could not remove everything in $real." "Some files may be left over."
+        return 1
+    fi
+    if [[ $jmaj =~ ^[0-9]+$ ]]; then
+        find_servers
+        if [ -z "$(servers_using_java "$jmaj")" ] && find_java "$jmaj" >/dev/null; then
+            note "${DIM}Java $jmaj is not needed by any server now. You can remove it with option j to free space.${RST}"
+        fi
+    fi
+    return 0
+}
+
+# ── Java ──
+installed_javas() { # prints each installed major version once
+    local d b
+    shopt -s nullglob
+    for d in "$PREFIX"/lib/jvm/*; do
+        b=${d##*/}
+        if [[ $b =~ ^java-([0-9]+)-openjdk$ ]] || [[ $b =~ ^openjdk-([0-9]+)$ ]]; then
+            [ -x "$d/bin/java" ] && printf '%s\n' "${BASH_REMATCH[1]}"
+        fi
+    done | sort -nu
+    shopt -u nullglob
+}
+
+servers_using_java() { # servers_using_java MAJOR → "1.21.11, 1.20.6"
+    local d out=""
+    for d in "${SERVERS[@]}"; do
+        [ "$(conf_get "$d/server.conf" JAVA_MAJOR)" = "$1" ] && out+="${out:+, }$(server_version "$d")"
+    done
+    printf '%s' "$out"
+}
+
+java_use_text() { # java_use_text "1.21.11, 1.20.6" or ""
+    if [ -n "$1" ]; then printf 'used by %s' "$1"; else printf 'not used by any server'; fi
+}
+
+missing_javas() { # Java versions that servers need but are not installed
+    local d m
+    for d in "${SERVERS[@]}"; do
+        m=$(conf_get "$d/server.conf" JAVA_MAJOR)
+        [[ $m =~ ^[0-9]+$ ]] && ! find_java "$m" >/dev/null && printf '%s\n' "$m"
+    done | sort -nu
+}
+
+pkg_ready() {
+    command -v pkg >/dev/null 2>&1 && return 0
+    err "I can't install or remove Java here (the \"pkg\" tool is missing)." \
+        "Use your package manager for openjdk-N instead."
+    return 1
+}
+
+install_java() {
+    local -a miss=()
+    local def="" v ans
+    mapfile -t miss < <(missing_javas)
+    def=${miss[0]:-}
+    pkg_ready || return 1
+    printf '\n'
+    note "Java is the program that runs Minecraft. Newer Minecraft versions need newer Java."
+    [ -z "$def" ] || warn "Your servers need Java ${miss[*]} and it is not installed."
+    printf '\n  Which Java number should I install (for example 21)%s: ' "${def:+, Enter for $def}"
+    read -r ans || { printf '\n'; return 0; }
+    v=$(trim "${ans:-$def}")
+    [ -n "$v" ] || { note "Cancelled."; return 0; }
+    if [[ ! $v =~ ^[0-9]{1,2}$ ]]; then warn "Please type just a number, like 21."; return 0; fi
+    if find_java "$v" >/dev/null; then good "Java $v is already installed."; return 0; fi
+    if pkg install -y "openjdk-$v" </dev/null && find_java "$v" >/dev/null; then
+        good "Java $v installed."
+    else
+        local avail
+        avail=$(pkg list-all 2>/dev/null | grep -oE '^openjdk-[0-9]+' | sort -Vu | tr '\n' ' ' || true)
+        err "Termux could not install Java $v (package openjdk-$v)." \
+            "Java packages Termux lists right now: ${avail:-unknown}" \
+            "If the message above mentions a conflict with another openjdk package," \
+            "remove that one from this menu first. Nothing was removed for you."
+        return 1
+    fi
+}
+
+remove_java() {
+    local -a have=() labels=()
+    local j uses
+    find_servers
+    mapfile -t have < <(installed_javas)
+    if [ "${#have[@]}" -eq 0 ]; then warn "No Java is installed."; return 0; fi
+    pkg_ready || return 1
+    for j in "${have[@]}"; do
+        uses=$(servers_using_java "$j")
+        labels+=("Java $j  ${DIM}$(java_use_text "$uses")${RST}")
+    done
+    pick_from "Which Java do you want to remove?" "${labels[@]}" || return 0
+    j=${have[$((PICK - 1))]}
+    uses=$(servers_using_java "$j")
+    if [ -n "$uses" ]; then
+        warn "These servers need Java $j: $uses"
+        note "They will not start until Java $j is installed again (mcstart offers to do that)."
+    fi
+    yesno "Remove Java $j?" n || { note "Cancelled. Nothing was removed."; return 0; }
+    if pkg uninstall -y "openjdk-$j" </dev/null && ! find_java "$j" >/dev/null; then
+        good "Java $j removed."
+    else
+        err "Could not remove Java $j." \
+            "It may not have been installed as the package openjdk-$j, or another package needs it."
+        return 1
+    fi
+}
+
+java_menu() {
+    local -a have=() miss=()
+    local j uses c
+    while :; do
+        find_servers
+        mapfile -t have < <(installed_javas)
+        mapfile -t miss < <(missing_javas)
+        printf '\n  %sJava on this phone%s\n\n' "$BOLD" "$RST"
+        if [ "${#have[@]}" -eq 0 ]; then
+            note "No Java installed yet."
+        else
+            for j in "${have[@]}"; do
+                uses=$(servers_using_java "$j")
+                printf '   Java %s  %s%s%s\n' "$j" "$DIM" "$(java_use_text "$uses")" "$RST"
+            done
+        fi
+        [ "${#miss[@]}" -eq 0 ] || { printf '\n'; warn "Missing, but needed by a server: Java ${miss[*]}"; }
+        printf '\n   1. Install a Java version\n   2. Remove a Java version\n   0. Back\n\n  Choose: '
+        read -r c || { printf '\n'; return 0; }
+        case "$(trim "$c")" in
+            1) install_java || true ;;
+            2) remove_java || true ;;
+            0) return 0 ;;
+            *) warn "Please type 0, 1 or 2." ;;
+        esac
+    done
+}
+
+# ── menu ──
 draw_menu() {
     local -a rows=("$@")
+    local -a extra=("i. Install a new server" "r. Remove a server" "j. Install / remove Java" "u. Update mcstart")
     local w=36 r i line
-    for r in "${rows[@]}"; do [ "${#r}" -gt $((w - 4)) ] && w=$((${#r} + 4)); done
+    for r in "${rows[@]}" "${extra[@]}"; do [ "${#r}" -gt $((w - 4)) ] && w=$((${#r} + 4)); done
     local bar=""
     for ((i = 0; i < w; i++)); do bar+="$C_H"; done
     center() {
@@ -741,7 +1013,7 @@ draw_menu() {
     }
     row() { printf '%s  %-*s%s\n' "$C_V" "$((w - 2))" "$1" "$C_V"; }
     blank() { printf '%s%*s%s\n' "$C_V" "$w" "" "$C_V"; }
-    printf '\n%s%s%s%s\n' "$C_TL" "$bar" "$C_TR" ""
+    printf '\n%s%s%s\n' "$C_TL" "$bar" "$C_TR"
     center "PaperMC Server"
     blank
     center "Select a server"
@@ -749,29 +1021,48 @@ draw_menu() {
     blank
     for line in "${rows[@]}"; do row "$line"; done
     blank
+    for line in "${extra[@]}"; do row "$line"; done
+    blank
     row "0. Exit"
     blank
     printf '%s%s%s\n\n' "$C_BL" "$bar" "$C_BR"
 }
 
-choose_and_start() {
-    local -a rows=()
-    local i n=${#SERVERS[@]} choice
-    for ((i = 0; i < n; i++)); do rows+=("$((i + 1)). Minecraft $(server_version "${SERVERS[$i]}")"); done
+main_menu() {
+    local -a rows
+    local i n choice redraw=1
     while :; do
-        draw_menu "${rows[@]}"
-        while :; do
-            printf 'Choose a server: '
-            read -r choice || { printf '\n'; exit 0; }
-            choice=${choice#"${choice%%[![:space:]]*}"}
-            choice=${choice%"${choice##*[![:space:]]}"}
-            if [ "$choice" = 0 ]; then note "Goodbye!"; exit 0; fi
-            if [[ $choice =~ ^[0-9]+$ ]] && [ "$((10#$choice))" -ge 1 ] && [ "$((10#$choice))" -le "$n" ]; then
-                start_server "${SERVERS[$((10#$choice - 1))]}" || true
-                break   # could not start: show the menu again
-            fi
-            printf '  %sPlease type a number from 0 to %s.%s\n' "$YEL" "$n" "$RST"
-        done
+        if [ "$redraw" = 1 ]; then
+            find_servers
+            n=${#SERVERS[@]}
+            rows=()
+            for ((i = 0; i < n; i++)); do rows+=("$((i + 1)). Minecraft $(server_version "${SERVERS[$i]}")"); done
+            [ "$n" -gt 0 ] || rows=("(no servers installed yet)")
+            draw_menu "${rows[@]}"
+        fi
+        redraw=1
+        printf 'Choose an option: '
+        read -r choice || { printf '\n'; exit 0; }
+        choice=$(trim "$choice")
+        choice=${choice,,}
+        case $choice in
+            0) note "Goodbye!"; exit 0 ;;
+            i) install_server_menu ;;
+            r) remove_server || true ;;
+            j) java_menu ;;
+            u) if update_mcstart; then exec "$0"; fi ;;
+            *)
+                if [[ $choice =~ ^[0-9]+$ ]] && [ "$((10#$choice))" -ge 1 ] && [ "$((10#$choice))" -le "$n" ]; then
+                    start_server "${SERVERS[$((10#$choice - 1))]}" || true   # only returns if it could not start
+                else
+                    if [ "$n" -gt 0 ]; then
+                        printf '  %sPlease type a number from 0 to %s, or one of the letters i, r, j, u.%s\n' "$YEL" "$n" "$RST"
+                    else
+                        printf '  %sType i to install a server, or 0 to exit.%s\n' "$YEL" "$RST"
+                    fi
+                    redraw=0
+                fi ;;
+        esac
     done
 }
 
@@ -792,14 +1083,16 @@ list_servers() {
 usage() {
     cat <<EOF
 
-  mcstart - start a Minecraft server with one command
+  mcstart - start and manage your Minecraft servers with one command
 
-    mcstart          pick a server from a menu and start it
-    mcstart --list   show installed servers without starting one
-    mcstart --help   show this help
+    mcstart            open the menu: start, install or remove servers, manage Java
+    mcstart --list     show installed servers without starting one
+    mcstart --update   update mcstart (and mcwhitelist) to the newest version
+    mcstart --help     show this help
 
-  Install more servers, or change a server's RAM, by running the installer:
-    $INSTALL_CMD
+  In the menu:  a number starts that server,
+                i = install a new server      r = remove a server
+                j = install / remove Java     u = update mcstart
 
   Servers live in: $ROOT
 
@@ -815,13 +1108,12 @@ case "${1:-}" in
         list_servers
         printf '\n'
         exit 0 ;;
+    -u | --update) update_mcstart; exit $? ;;
     "") ;;
     *) err "I don't understand \"$1\"." "Try: mcstart --help"; exit 2 ;;
 esac
 
-find_servers
-if [ "${#SERVERS[@]}" -eq 0 ]; then no_servers_message; exit 1; fi
-choose_and_start
+main_menu
 MCCMD_EOF
 }
 
@@ -1132,24 +1424,35 @@ main_menu
 MCCMD_EOF
 }
 
-# install_command NAME → installs or updates $PREFIX/bin/NAME. Never touches a file that
-# paper.sh did not create, and does not rewrite one that is already up to date.
+# install_command NAME → installs or updates $PREFIX/bin/NAME.
+#  - a file paper.sh did not create (no marker line) is never touched
+#  - a file paper.sh created is replaced when its contents differ from the current version
+#    (older, edited or damaged copies all get fixed), and left alone when identical
 install_command() {
-    local name=$1 dest="$PREFIX/bin/$1" tmp
+    local name=$1 dest="$PREFIX/bin/$1" tmp existed=0
     mkdir -p "$PREFIX/bin" 2>/dev/null || { warn "Could not create $PREFIX/bin"; return 1; }
     if [ -e "$dest" ] || [ -L "$dest" ]; then
-        if ! grep -qx "# paper.sh-managed: $name v[0-9]*" "$dest" 2>/dev/null; then
+        existed=1
+        if ! grep -q "^# paper.sh-managed: $name v[0-9]*$" "$dest" 2>/dev/null; then
             warn "A different \"$name\" command already exists ($dest). I left it alone."
+            say "${DIM}If it is an old copy you do not need: rm $dest  and run this installer again.${RST}"
             return 1
-        fi
-        if grep -qx "# paper.sh-managed: $name v$CMD_VERSION" "$dest"; then
-            ok "Command \"$name\" is already installed"
-            return 0
         fi
     fi
     tmp=$(mktemp "$dest.XXXXXX") || { warn "Could not write to $PREFIX/bin"; return 1; }
-    if "emit_$name" >"$tmp" && bash -n "$tmp" && chmod 755 "$tmp" && mv -f "$tmp" "$dest"; then
-        ok "Command \"$name\" installed. Type: $name"
+    if ! "emit_$name" >"$tmp" || ! bash -n "$tmp"; then
+        rm -f "$tmp"
+        warn "Could not prepare the \"$name\" command."
+        return 1
+    fi
+    if [ "$existed" = 1 ] && [ -x "$dest" ] && cmp -s "$tmp" "$dest"; then
+        rm -f "$tmp"
+        ok "Command \"$name\" is up to date"
+        return 0
+    fi
+    if chmod 755 "$tmp" && mv -f "$tmp" "$dest"; then
+        if [ "$existed" = 1 ]; then ok "Command \"$name\" updated to the newest version"
+        else ok "Command \"$name\" installed. Type: $name"; fi
         return 0
     fi
     rm -f "$tmp"
@@ -1332,11 +1635,22 @@ main() {
     trap cleanup EXIT
     trap 'printf "\n  Unexpected error on line %s. Nothing was deleted.\n" "$LINENO" >&2' ERR
     setup_ui
+    if [ "${1:-}" = --update ]; then
+        if [ "${PAPER_ALLOW_NON_TERMUX:-0}" != 1 ] && [[ $PREFIX != */com.termux/* ]]; then
+            die "This installer is made for Termux on Android."
+        fi
+        install_commands
+        return 0
+    fi
     banner
     check_termux
     info "Checking tools..."
     ensure_tools
     install_commands
+    if [ "${1:-}" = --install ]; then
+        install_server
+        return 0
+    fi
     list_servers
     if [ "${#SERVERS[@]}" -eq 0 ]; then
         say "No servers installed yet. Let's set one up."
